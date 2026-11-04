@@ -9,7 +9,8 @@
       1. 校验备份目录与 restore-dsh.ps1 存在；
       2. 用隐藏窗口启动 restore-dsh.ps1（-WaitForExit -RestartApp），脱离当前会话；
          默认恢复配置、插件离线依赖、历史会话与附件；
-      3. 提示用户：在任务栏托盘退出 DSH，恢复会自动继续，完成后自动重新打开 DSH。
+      3. 提示用户：在任务栏托盘退出 DSH，恢复会自动继续，完成后自动重新打开 DSH；
+         恢复期间会弹出置顶的“DSH 恢复进度”小窗口（只读，关闭不影响恢复）。
 
     如果后台进程随 DSH 退出被一起回收（少数环境），按 README 的“手动兜底”章节：
     退出 DSH 后自己打开 PowerShell 运行
@@ -73,6 +74,9 @@ if ($SkipUserData) {
     Write-Host '  将恢复：配置、插件离线依赖、历史会话与附件（默认）。'
 }
 Write-Host '  即将启动后台恢复进程（隐藏窗口）。'
+Write-Host '  恢复开始后会弹出一个置顶的“DSH 恢复进度”小窗口：'
+Write-Host '  显示当前阶段、百分比、已用时间与预计剩余时间；可最小化，直接关闭也不影响恢复。'
+Write-Host ('  进度日志: ' + $env:TEMP + '\dsh-restore-progress.log')
 Write-Host ''
 Write-Host '  >>> 现在请在任务栏托盘右键 DSH 图标，选择“退出” <<<'
 Write-Host ('  退出后恢复会自动开始，完成后自动重新启动 DSH（最多等待 ' + $WaitTimeoutMin + ' 分钟）。')
