@@ -76,7 +76,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $skill 'scripts\m
    - `backup\config\`：profiles（desktop 含 13 个插件依赖与 24 个 bundles、web）、皮肤、技能、storages、任务板等；
    - `backup\offline\`：两个 profile 的 `node_modules`（离线可还原插件，无需联网重装）；
    - `backup\user-data-optional\`：sessions + attachments（除非 `-SkipUserData`）；
-   - `backup\scripts\`：`start-restore.ps1`、`restore-dsh.ps1`、`fix-restored-dsh.ps1`、`verify-backup.ps1`、`backup-dsh.ps1`；
+   - `backup\scripts\`：`start-restore.ps1`、`restore-dsh.ps1`、`show-progress.ps1`（恢复进度窗口）、`fix-restored-dsh.ps1`、`verify-backup.ps1`、`backup-dsh.ps1`；
    - `backup\manifest.json`：所有配置文件的 SHA256 清单（数量随插件/技能数变化，本机实测 80 个）；
    - `RECOVERY-GUIDE.md`、`README-FIRST.txt`、`kit-manifest.json`；
 4. **强制去凭据**：备份时传 `-ExcludeCredentials`，打包前再次扫描，若发现 `.credentials.yaml` 立即中止；
@@ -89,9 +89,9 @@ powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $skill 'scripts\m
 2. 双击 `DSH-kit-<版本>\installer\DeepSeek-Harness-<版本>-win-x64.exe` 安装同版本 DSH；
 3. 打开 DSH，新建会话，发消息：「迁移包解压在 `C:\DSH-kit\DSH-kit-<版本>`，请按其中 `RECOVERY-GUIDE.md` 恢复」；
 4. 该会话运行 `backup\scripts\start-restore.ps1`，按提示在任务栏托盘「退出 DSH」；
-5. 脚本自动复制配置与离线插件：先校验 `profiles\*\package.json` 与备份逐字节一致（防止被运行中的 DSH 改写）、逐个校验依赖能否解析（缺依赖报错退出，不会“假成功”），再把 desktop/web 的 `.modules.yaml` 改写成**本机** pnpm 路径（`storeDir` → `%LOCALAPPDATA%\pnpm\store\v11`，否则插件页报 `ERR_PNPM_UNEXPECTED_STORE`），恢复历史会话与附件（默认执行，`-SkipUserData` 可关），按会话缓存补建缺失的工作区目录，`dump-config` 校验后重启 DSH；**恢复期间若 DSH 被再次启动会报错中止**（配置可能被运行中的 DSH 覆盖，退出后重跑即可）；
+5. 脚本自动复制配置与离线插件：先校验 `profiles\*\package.json` 与备份逐字节一致（防止被运行中的 DSH 改写）、逐个校验依赖能否解析（缺依赖报错退出，不会“假成功”），再把 desktop/web 的 `.modules.yaml` 改写成**本机** pnpm 路径（`storeDir` → `%LOCALAPPDATA%\pnpm\store\v11`，否则插件页报 `ERR_PNPM_UNEXPECTED_STORE`），恢复历史会话与附件（默认执行，`-SkipUserData` 可关），按会话缓存补建缺失的工作区目录，`dump-config` 校验后重启 DSH；**恢复期间若 DSH 被再次启动会报错中止**（配置可能被运行中的 DSH 覆盖，退出后重跑即可）；恢复期间会弹出置顶的「DSH 恢复进度」小窗口（当前阶段 / 百分比 / 已用时间 / 预计剩余 / 正在复制的项目），窗口可关闭且不影响恢复，进度日志在 `%TEMP%\dsh-restore-progress.log`，不想要窗口可加 `-NoProgressWindow`；
 6. 重启后检查插件列表（应全部“已启用/已安装”）与历史会话；若插件异常/包不可用，**不要点在线“安装/修复”**，改为在 DSH 退出后运行 `backup\scripts\fix-restored-dsh.ps1 -RestartApp`（见 RECOVERY-GUIDE 排错表）；旧会话点开异常多为工作区目录缺失，恢复脚本已自动补建空目录，项目代码需另拷；
-7. 重新登录 DSH 并重填 对应 provider 的 API Key（迁移包不含任何凭据/API Key）。
+7. 重新登录 DSH 并重填 `QWEN_TOKEN_PLAN_CN_API_KEY`（迁移包不含任何凭据/API Key）。
 
 手动兜底：完全退出 DSH 后执行
 
