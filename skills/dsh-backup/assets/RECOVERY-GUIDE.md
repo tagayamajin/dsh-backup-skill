@@ -33,6 +33,7 @@ DSH-kit-0.2.1-rc.5\
    └─ scripts\
       ├─ start-restore.ps1           ← ★ agent 用这个（后台恢复 + 等用户退出 + 自动重启）
       ├─ restore-dsh.ps1             ← 真正的恢复脚本（也可手动运行）
+      ├─ show-progress.ps1           ← 恢复进度小窗口（restore-dsh.ps1 自动启动，也可手动运行查看）
       ├─ fix-restored-dsh.ps1        ← ★ 恢复后插件异常 / 会话打不开时的修复工具
       ├─ backup-dsh.ps1              ← 以后重新制作备份用
       └─ verify-backup.ps1           ← 校验备份完整性用
@@ -40,7 +41,7 @@ DSH-kit-0.2.1-rc.5\
 
 说明：本包**不包含** `.credentials.yaml`、API Key 等凭据（用户要求不带）。恢复后需要重新登录。
 
-> **v3 包（2026-11-04 起）新增行为**：恢复时自动改写 `.modules.yaml` 的 pnpm 路径（适配新机，避免 `ERR_PNPM_UNEXPECTED_STORE`）；复制配置前后比对 DSH 进程，**恢复期间若 DSH 被启动会报错中止**（防止配置被运行中的 DSH 覆盖）；校验 `profiles\*\package.json` 与备份一致；按历史会话补建缺失的工作区目录；检查 `cordis.patch.yml` 引用的插件是否有实体包。
+> **v3 包（2026-11-04 起）新增行为**：恢复时自动改写 `.modules.yaml` 的 pnpm 路径（适配新机，避免 `ERR_PNPM_UNEXPECTED_STORE`）；复制配置前后比对 DSH 进程，**恢复期间若 DSH 被启动会报错中止**（防止配置被运行中的 DSH 覆盖）；校验 `profiles\*\package.json` 与备份一致；按历史会话补建缺失的工作区目录；检查 `cordis.patch.yml` 引用的插件是否有实体包。**恢复期间会显示置顶进度窗口**（当前阶段 / 百分比 / 已用时间 / 预计剩余 / 正在复制的项目），窗口可关闭、不影响恢复；日志同样写入 `%TEMP%\dsh-restore-progress.log`。
 
 ---
 
@@ -97,6 +98,8 @@ powershell -NoProfile -ExecutionPolicy Bypass -File "<kit>\backup\scripts\start-
 
 > 请在任务栏托盘右键 DSH 图标 → 选择「退出」，让 DSH 完全退出。恢复会自动开始，完成后会重新打开 DSH。
 
+恢复开始后，屏幕上（置顶）会出现「DSH 恢复进度」小窗口，显示：当前阶段（复制配置 / 复制插件依赖 / 恢复会话…）、百分比、已用时间、预计剩余时间、正在处理的项目。窗口是只读的，**直接关掉也不影响恢复**；进度同时写入 `%TEMP%\dsh-restore-progress.log`。若不需要窗口，可手动运行 `restore-dsh.ps1` 时加 `-NoProgressWindow`。
+
 之后后台 `restore-dsh.ps1 -WaitForExit -RestartApp` 会自动执行：
 
 1. 等待 DSH 进程全部退出（默认最长 120 分钟，每 3 秒检查一次）；
@@ -131,6 +134,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File "<kit>\backup\scripts\restor
 
 - 只想先看计划、不修改文件：追加 `-DryRun`。
 - 不想自动重启：把 `-RestartApp` 去掉。
+- 不想要进度窗口：加 `-NoProgressWindow`（进度仍会写入 `%TEMP%\dsh-restore-progress.log`）。
 - 恢复过程中不要关闭 PowerShell 窗口；建议暂时关闭杀毒软件对 `robocopy` / 大量小文件复制的拦截。
 
 ---
@@ -170,8 +174,8 @@ Get-ChildItem "$env:USERPROFILE\.dsh\storages\session_projcache\sessions\*.json"
 再让用户确认（图形界面）：
 
 - 设置/插件页面能看到已安装插件（保存令牌、ego 浏览器、billion-context、pilot、whale widget 等）；
-- 你安装的主题/皮肤插件仍在生效（取决于备份机是否安装）；
-- 默认模型与备份机一致（若备份机用的是第三方 provider，需重新填写对应 API Key）；
+- 皮肤 `dsh-claude-style` 生效；
+- 默认模型为 `qwen-token-plan-cn/deepseek-v4.1-flash`；
 - 左侧会话列表中出现历史会话（如包内带了 sessions），点开不报错（恢复脚本已补建缺失的工作区空目录；项目文件仍需另拷）。
 
 ---
@@ -180,7 +184,7 @@ Get-ChildItem "$env:USERPROFILE\.dsh\storages\session_projcache\sessions\*.json"
 
 1. **重新登录** DSH 账号（设置 → 账号/登录，或按提示登录 DeepSeek）。
 2. **重新配置环境变量或 API Key**：
-   - 第三方 provider 的 API Key（例如备份机配置过的任意模型服务商；恢复后到 设置 → 模型 重新填写）；
+   - 插件使用的 `QWEN_TOKEN_PLAN_CN_API_KEY`（provider `https://maas.qianwenaiapi.com/compatible-mode/v1`）；
    - 设置 → 模型/环境变量（或系统环境变量）中重新填写；
    - 其它插件 secret（browser session、approval gate 等）按需重新登录/授权。
 3. 确认 `%USERPROFILE%\.dsh\.credentials.yaml` **不存在**（本包故意未包含）；首次使用新账号登录后会自行生成。
