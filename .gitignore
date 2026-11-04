@@ -1,0 +1,13 @@
+# DSH backup kits / restored artifacts
+*.zip
+*.zip.sha256
+DSH-kit-*
+.dsh.bak-*
+
+# OS noise
+Thumbs.db
+desktop.ini
+.DS_Store
+
+# Local notes
+*.local.md
