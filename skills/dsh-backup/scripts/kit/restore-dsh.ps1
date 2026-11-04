@@ -69,6 +69,7 @@ param(
     [switch]$WaitForExit,
     [int]$WaitTimeoutMin = 120,
     [switch]$RestartApp,
+    [switch]$NoProgressWindow,
     [string]$LogFile
 )
 
@@ -85,6 +86,201 @@ try {
     $script:transcriptOn = $true
 } catch {
     Write-Host ('[警告] 无法开启日志 transcript: ' + $_.Exception.Message)
+}
+
+# ---------------------------------------------------------------------------
+# 进度显示
+#   恢复通常由 start-restore.ps1 以隐藏窗口启动，用户看不到控制台输出，
+#   因此这里把进度写入状态文件，并另外启动一个置顶小窗口（show-progress.ps1）
+#   显示：当前阶段、百分比、已用时间、预计剩余时间。
+# ---------------------------------------------------------------------------
+$script:ScriptRoot = $PSScriptRoot
+$script:ProgressTitle = 'DSH 恢复进度'
+$script:ProgressStateFile = Join-Path $env:TEMP 'dsh-restore-progress.json'
+$script:ProgressLogFile = Join-Path $env:TEMP 'dsh-restore-progress.log'
+$script:ProgressStart = Get-Date
+$script:ProgressCopiedBytes = [double]0
+$script:ProgressTotalBytes = [double]0
+$script:ProgressEtaSec = $null
+$script:ProgressPhase = '准备中'
+$script:ProgressDetail = ''
+$script:ProgressDone = $false
+$script:ProgressFailed = $false
+$script:ProgressError = ''
+$script:ProgressLastWrite = [datetime]::MinValue
+$script:ProgressViewerLaunched = $false
+
+function ConvertTo-JsonText {
+    param([string]$Value)
+    if ($null -eq $Value) { return '""' }
+    $s = $Value.Replace('\', '\\')
+    $s = $s.Replace('"', '\"')
+    $s = $s.Replace("`r", '\r')
+    $s = $s.Replace("`n", '\n')
+    $s = $s.Replace("`t", '\t')
+    return '"' + $s + '"'
+}
+
+function Format-Duration {
+    param([double]$Seconds)
+    if ($Seconds -lt 0) { $Seconds = 0 }
+    $total = [int][math]::Round($Seconds)
+    if ($total -ge 3600) {
+        $h = [int][math]::Floor($total / 3600)
+        $m = [int][math]::Floor(($total % 3600) / 60)
+        $s = $total % 60
+        return ('{0}:{1:00}:{2:00}' -f $h, $m, $s)
+    }
+    $m = [int][math]::Floor($total / 60)
+    $s = $total % 60
+    return ('{0:00}:{1:00}' -f $m, $s)
+}
+
+function Format-Size {
+    param([double]$Bytes)
+    if ($Bytes -ge 1073741824) { return ('{0:N2} GB' -f ($Bytes / 1073741824)) }
+    if ($Bytes -ge 1048576) { return ('{0:N1} MB' -f ($Bytes / 1048576)) }
+    if ($Bytes -ge 1024) { return ('{0:N0} KB' -f ($Bytes / 1024)) }
+    return ('{0:N0} B' -f $Bytes)
+}
+
+function Get-TreeBytes {
+    param([string]$Path)
+    $sum = [double]0
+    if ([string]::IsNullOrWhiteSpace($Path)) { return $sum }
+    if (-not [System.IO.Directory]::Exists($Path)) { return $sum }
+    $stack = New-Object System.Collections.Stack
+    $stack.Push($Path)
+    while ($stack.Count -gt 0) {
+        $dir = [string]$stack.Pop()
+        try {
+            $di = New-Object System.IO.DirectoryInfo($dir)
+            foreach ($fi in $di.GetFiles()) {
+                try { $sum += [double]$fi.Length } catch { }
+            }
+            foreach ($sub in $di.GetDirectories()) {
+                try {
+                    $attrs = $sub.Attributes
+                    if (($attrs -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) { continue }
+                    $stack.Push($sub.FullName)
+                } catch { }
+            }
+        } catch { }
+    }
+    return $sum
+}
+
+function Write-ProgressState {
+    param([switch]$Force)
+    $now = Get-Date
+    if (-not $Force) {
+        if ($script:ProgressLastWrite -ne [datetime]::MinValue) {
+            if (($now - $script:ProgressLastWrite).TotalMilliseconds -lt 700) { return }
+        }
+    }
+    $script:ProgressLastWrite = $now
+    $elapsed = ($now - $script:ProgressStart).TotalSeconds
+
+    $pct = -1
+    if ($script:ProgressTotalBytes -gt 0) {
+        $ratio = $script:ProgressCopiedBytes / $script:ProgressTotalBytes
+        if ($ratio -lt 0) { $ratio = 0 }
+        if ($ratio -gt 1) { $ratio = 1 }
+        $pct = [int][math]::Floor(3 + 92 * $ratio)
+        if ($pct -gt 95) { $pct = 95 }
+    }
+    if ($script:ProgressDone -and -not $script:ProgressFailed) { $pct = 100 }
+
+    $etaSec = -1
+    if (-not $script:ProgressDone -and $script:ProgressTotalBytes -gt 0 -and $script:ProgressCopiedBytes -gt 0) {
+        $raw = $elapsed * (($script:ProgressTotalBytes - $script:ProgressCopiedBytes) / $script:ProgressCopiedBytes)
+        if ($raw -lt 0) { $raw = 0 }
+        if ($raw -gt 86400) { $raw = 86400 }
+        if ($null -eq $script:ProgressEtaSec) { $script:ProgressEtaSec = $raw }
+        else { $script:ProgressEtaSec = 0.75 * [double]$script:ProgressEtaSec + 0.25 * $raw }
+        $etaSec = [int][math]::Round([double]$script:ProgressEtaSec)
+    }
+
+    $etaText = '计算中'
+    if ($etaSec -ge 0) { $etaText = '约 ' + (Format-Duration $etaSec) }
+    if ($script:ProgressDone -and -not $script:ProgressFailed) { $etaText = '已完成' }
+    $indet = 'false'
+    if ($pct -lt 0 -and -not $script:ProgressDone) { $indet = 'true' }
+    $doneText = 'false'
+    if ($script:ProgressDone) { $doneText = 'true' }
+
+    $json = '{' +
+        '"Title":' + (ConvertTo-JsonText $script:ProgressTitle) + ',' +
+        '"Phase":' + (ConvertTo-JsonText $script:ProgressPhase) + ',' +
+        '"Detail":' + (ConvertTo-JsonText $script:ProgressDetail) + ',' +
+        '"Percent":' + [int]$pct + ',' +
+        '"Indeterminate":' + $indet + ',' +
+        '"ElapsedSec":' + [int][math]::Round($elapsed) + ',' +
+        '"ElapsedText":' + (ConvertTo-JsonText (Format-Duration $elapsed)) + ',' +
+        '"EtaSec":' + [int]$etaSec + ',' +
+        '"EtaText":' + (ConvertTo-JsonText $etaText) + ',' +
+        '"Done":' + $doneText + ',' +
+        '"Error":' + (ConvertTo-JsonText $script:ProgressError) + ',' +
+        '"LogFile":' + (ConvertTo-JsonText $LogFile) + '}'
+
+    try {
+        $tmp = $script:ProgressStateFile + '.tmp'
+        [System.IO.File]::WriteAllText($tmp, $json, (New-Object System.Text.UTF8Encoding($false)))
+        Move-Item -LiteralPath $tmp -Destination $script:ProgressStateFile -Force
+    } catch { }
+    try {
+        $pctText = '   --'
+        if ($pct -ge 0) { $pctText = ('{0,3}%' -f $pct) }
+        $line = '{0} {1}  {2}  {3}' -f (Get-Date -Format 'HH:mm:ss'), $pctText, $script:ProgressPhase, $script:ProgressDetail
+        [System.IO.File]::AppendAllText($script:ProgressLogFile, $line + [Environment]::NewLine, (New-Object System.Text.UTF8Encoding($false)))
+    } catch { }
+    try {
+        if ($pct -ge 0) {
+            Write-Progress -Activity $script:ProgressTitle -Status ($script:ProgressPhase + ' ' + $pct + '%') -PercentComplete $pct
+        } else {
+            Write-Progress -Activity $script:ProgressTitle -Status $script:ProgressPhase
+        }
+    } catch { }
+}
+
+function Set-Progress {
+    param([string]$Phase = '', [string]$Detail = '', [double]$DoneBytes = -1, [switch]$Force)
+    if ($Phase -ne '') { $script:ProgressPhase = $Phase }
+    if ($Detail -ne '') { $script:ProgressDetail = $Detail }
+    if ($DoneBytes -ge 0) { $script:ProgressCopiedBytes = $DoneBytes }
+    Write-ProgressState -Force:$Force
+}
+
+function Add-CopiedBytes {
+    param([double]$Bytes)
+    if ($Bytes -gt 0) { $script:ProgressCopiedBytes += $Bytes }
+}
+
+function Complete-Progress {
+    param([string]$Phase = '恢复完成', [string]$Detail = '')
+    if ($Phase -ne '') { $script:ProgressPhase = $Phase }
+    $script:ProgressDetail = $Detail
+    $script:ProgressCopiedBytes = $script:ProgressTotalBytes
+    $script:ProgressDone = $true
+    $script:ProgressEtaSec = -1
+    Write-ProgressState -Force
+    try { Write-Progress -Activity $script:ProgressTitle -Completed } catch { }
+}
+
+function Start-ProgressViewer {
+    if ($DryRun -or $NoProgressWindow) { return }
+    $viewer = Join-Path $script:ScriptRoot 'show-progress.ps1'
+    if (-not (Test-Path -LiteralPath $viewer)) {
+        Write-Warn ('未找到进度窗口脚本: ' + $viewer + '（恢复仍会继续，可查看进度日志: ' + $script:ProgressLogFile + '）')
+        return
+    }
+    try {
+        $viewerArgs = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $viewer, '-StateFile', $script:ProgressStateFile)
+        Start-Process -FilePath 'powershell.exe' -ArgumentList $viewerArgs -WindowStyle Hidden | Out-Null
+        $script:ProgressViewerLaunched = $true
+    } catch {
+        Write-Warn ('无法启动进度窗口: ' + $_.Exception.Message + '（可查看进度日志: ' + $script:ProgressLogFile + '）')
+    }
 }
 
 function Write-Step {
@@ -106,11 +302,20 @@ function Write-Warn {
 function Fail {
     param([string]$Message)
     Write-Host ('[错误] ' + $Message) -ForegroundColor Red
+    try {
+        $script:ProgressFailed = $true
+        $script:ProgressDone = $true
+        $script:ProgressPhase = '恢复失败'
+        $script:ProgressDetail = $Message
+        $script:ProgressError = $Message
+        Write-ProgressState -Force
+        Write-Progress -Activity $script:ProgressTitle -Completed
+    } catch { }
     exit 1
 }
 
 function Copy-Tree {
-    param([string]$Source, [string]$Destination)
+    param([string]$Source, [string]$Destination, [string]$Phase = '')
     if (-not (Test-Path -LiteralPath $Source)) {
         Write-Info ('跳过（不存在）: ' + $Source)
         return
@@ -119,10 +324,29 @@ function Copy-Tree {
         Write-Info ('[DryRun] robocopy ' + $Source + ' -> ' + $Destination)
         return
     }
+    if ($Phase -ne '') {
+        Set-Progress -Phase $Phase -Detail ('正在复制 ' + (Split-Path -Leaf $Source) + ' …') -Force
+    }
+    $sizeBefore = Get-TreeBytes -Path $Destination
     $rcArgs = @($Source, $Destination, '/E', '/XJ', '/NFL', '/NDL', '/NJH', '/NJS', '/NP', '/R:1', '/W:1')
-    & robocopy @rcArgs | Out-Null
-    if ($LASTEXITCODE -ge 8) {
-        Fail ('robocopy 失败（exit ' + $LASTEXITCODE + '）: ' + $Source + ' -> ' + $Destination)
+    $proc = Start-Process -FilePath 'robocopy.exe' -ArgumentList $rcArgs -WindowStyle Hidden -PassThru
+    while (-not $proc.HasExited) {
+        Start-Sleep -Milliseconds 1500
+        $current = Get-TreeBytes -Path $Destination
+        $delta = $current - $sizeBefore
+        if ($delta -gt 0) {
+            $script:ProgressCopiedBytes += $delta
+            $sizeBefore += $delta
+        }
+        if ($Phase -ne '') {
+            Set-Progress -Detail ('正在复制 ' + (Split-Path -Leaf $Source) + ' … ' + (Format-Size $sizeBefore))
+        } else {
+            Write-ProgressState
+        }
+    }
+    $proc.WaitForExit()
+    if ($proc.ExitCode -ge 8) {
+        Fail ('robocopy 失败（exit ' + $proc.ExitCode + '）: ' + $Source + ' -> ' + $Destination)
     }
 }
 
@@ -347,6 +571,8 @@ Write-Info ('日志文件   : ' + $LogFile)
 Write-Info ('备份目录   : ' + $BackupDir)
 Write-Info ('DSH 数据目录: ' + $DshHome)
 Write-Info ('插件恢复方式: ' + $Plugins + $(if ($DryRun) { '  (DryRun)' } else { '' }))
+Set-Progress -Phase '准备中' -Detail '正在检查环境…' -Force
+Start-ProgressViewer
 
 $configDir = Join-Path $BackupDir 'config'
 if (-not (Test-Path -LiteralPath $configDir)) {
@@ -402,11 +628,14 @@ if ($running.Count -gt 0) {
         Write-Host ('  脚本会自动等待，最多 ' + $WaitTimeoutMin + ' 分钟；退出后自动继续恢复，无需再操作。')
         Write-Host '============================================================'
         Write-Host ''
+        Set-Progress -Phase '等待 DSH 退出' -Detail ('检测到 ' + $names + '，等待完全退出（最多 ' + $WaitTimeoutMin + ' 分钟）…') -Force
         $deadline = (Get-Date).AddMinutes($WaitTimeoutMin)
         while ((Get-Date) -lt $deadline) {
             Start-Sleep -Seconds 3
             $running = @(Get-DshProcesses -InstallDir $installDir)
             if ($running.Count -eq 0) { break }
+            $waited = [int]((Get-Date) - $script:ProgressStart).TotalSeconds
+            Set-Progress -Detail ('等待 DSH 退出中（已等待 ' + (Format-Duration $waited) + '）…')
         }
         if ($running.Count -gt 0) {
             $still = @($running | ForEach-Object { $_.Name + '(' + $_.ProcessId + ')' }) -join ', '
@@ -449,6 +678,31 @@ if (Test-Path -LiteralPath $DshHome) {
     $oldHome = $DshHome + '.bak-' + (Get-Date -Format 'yyyyMMdd-HHmmss')
 }
 
+# ---------------------------------------------------------------------------
+# 统计待复制数据总量（用于计算百分比与预计剩余时间）
+# ---------------------------------------------------------------------------
+Write-Step '统计待恢复数据大小'
+Set-Progress -Phase '统计备份大小' -Detail '正在统计需要复制的文件总量…' -Force
+$totalBytes = [double]0
+$totalBytes += Get-TreeBytes -Path $configDir
+if ($effectivePlugins -eq 'Offline') {
+    if (Test-Path -LiteralPath $offlineProfiles) {
+        foreach ($p in @(Get-ChildItem -LiteralPath $offlineProfiles -Directory -ErrorAction SilentlyContinue)) {
+            $totalBytes += Get-TreeBytes -Path (Join-Path $p.FullName 'node_modules')
+        }
+    }
+}
+if (-not $SkipUserData) {
+    foreach ($rel in @('sessions', 'attachments')) {
+        $totalBytes += Get-TreeBytes -Path (Join-Path $BackupDir ('user-data-optional\' + $rel))
+    }
+}
+if ($totalBytes -lt 1) { $totalBytes = 1 }
+$script:ProgressTotalBytes = $totalBytes
+$script:ProgressCopiedBytes = [double]0
+Write-Info ('待恢复数据: ' + (Format-Size $totalBytes))
+Set-Progress -Phase '准备恢复' -Detail ('待复制数据约 ' + (Format-Size $totalBytes)) -Force
+
 if ($DryRun) {
     Write-Step 'DryRun：将执行以下操作'
     if ($oldHome) { Write-Info ('将把现有数据目录改名为: ' + $oldHome) } else { Write-Info '目标数据目录不存在，将新建。' }
@@ -469,6 +723,7 @@ if ($DryRun) {
 # 1. 保存现有数据目录
 # ---------------------------------------------------------------------------
 Write-Step '处理现有 DSH 数据目录'
+Set-Progress -Phase '备份现有数据目录' -Detail '正在把现有 DSH 数据目录改名备份…' -Force
 if ($oldHome) {
     Write-Info ('改名: ' + $DshHome + '  ->  ' + $oldHome)
     Move-Item -LiteralPath $DshHome -Destination $oldHome
@@ -481,10 +736,11 @@ New-Item -ItemType Directory -Force -Path $DshHome | Out-Null
 # 2. 复制配置
 # ---------------------------------------------------------------------------
 Write-Step '复制配置与插件数据'
-Copy-Tree -Source $configDir -Destination $DshHome
+Copy-Tree -Source $configDir -Destination $DshHome -Phase '复制配置文件'
 
 # 修复 web（或其它 profile）的非法 overlay
 Write-Step '处理 cordis.patch.yml 修复文件'
+Set-Progress -Phase '修复 cordis.patch.yml' -Detail '检查并替换损坏的 overlay 文件…' -Force
 foreach ($profileDir in @(Get-ChildItem -LiteralPath (Join-Path $DshHome 'profiles') -Directory -ErrorAction SilentlyContinue)) {
     $fixed = Join-Path $profileDir.FullName 'cordis.patch.yml.fixed'
     $patch = Join-Path $profileDir.FullName 'cordis.patch.yml'
@@ -555,7 +811,7 @@ if ($effectivePlugins -eq 'Offline') {
             continue
         }
         Write-Info ('复制 profile ' + $p.Name + ' 的 node_modules（可能较慢）')
-        Copy-Tree -Source $srcNm -Destination (Join-Path $dstProfile 'node_modules')
+        Copy-Tree -Source $srcNm -Destination (Join-Path $dstProfile 'node_modules') -Phase ('复制插件依赖 ' + $p.Name)
 
         # .modules.yaml 里记录的是源机的 pnpm store 路径，必须改写成本机路径，否则插件页会报
         # ERR_PNPM_UNEXPECTED_STORE，安装/更新/卸载插件全部失败。
@@ -575,6 +831,7 @@ if ($effectivePlugins -eq 'Offline') {
         }
     }
     # 复制后强制校验：确认离线插件真的可用，避免“显示恢复完成、插件却全部异常”
+    Set-Progress -Phase '校验插件依赖' -Detail '检查每个 profile 的依赖是否都能解析…' -Force
     $failedProfiles = New-Object System.Collections.Generic.List[string]
     foreach ($p in @(Get-ChildItem -LiteralPath $offlineProfiles -Directory -ErrorAction SilentlyContinue)) {
         $srcNm = Join-Path $p.FullName 'node_modules'
@@ -599,6 +856,7 @@ if ($effectivePlugins -eq 'Offline') {
     }
 } else {
     Write-Step '联网安装插件依赖（pnpm install --no-frozen-lockfile）'
+    Set-Progress -Phase '联网安装插件依赖' -Detail '正在准备 pnpm install（需要网络，可能需要数分钟）…' -Force
     $nodeExe = Join-Path $installDir 'resources\runtime\primary-runtime\dependencies\node\bin\node.exe'
     $pnpmCjs = Join-Path $installDir 'resources\runtime\primary-runtime\dependencies\pnpm\bin\pnpm.cjs'
     if (-not (Test-Path -LiteralPath $nodeExe)) { Fail ('未找到 DSH 随附的 node: ' + $nodeExe) }
@@ -608,6 +866,7 @@ if ($effectivePlugins -eq 'Offline') {
         $pkg = Join-Path $profileDir.FullName 'package.json'
         if (-not (Test-Path -LiteralPath $pkg)) { continue }
         Write-Info ('安装 profile ' + $profileDir.Name + ' 依赖（需要网络，可能需要数分钟）')
+        Set-Progress -Detail ('正在安装 profile ' + $profileDir.Name + ' 的依赖（需要网络）…') -Force
         Push-Location -LiteralPath $profileDir.FullName
         try {
             & $nodeExe $pnpmCjs install --no-frozen-lockfile
@@ -628,11 +887,12 @@ if ($effectivePlugins -eq 'Offline') {
 # ---------------------------------------------------------------------------
 if (-not $SkipUserData) {
     Write-Step '恢复用户数据（sessions / attachments）'
+    Set-Progress -Phase '恢复用户数据' -Detail '正在恢复会话日志与附件…' -Force
     foreach ($rel in @('sessions', 'attachments')) {
         $src = Join-Path $BackupDir ('user-data-optional\' + $rel)
         if (Test-Path -LiteralPath $src) {
             Write-Info ('恢复 ' + $rel)
-            Copy-Tree -Source $src -Destination (Join-Path $DshHome $rel)
+            Copy-Tree -Source $src -Destination (Join-Path $DshHome $rel) -Phase ('恢复 ' + $rel)
         } else {
             Write-Info ('备份中没有 ' + $rel + '，跳过')
         }
@@ -658,6 +918,7 @@ if (-not $SkipUserData) {
 # 历史会话的工作区目录：新机通常没有这些目录，会话列表能看到但点开会异常。
 # 这里按会话缓存里记录的 cwd 默认补建空目录（迁移包不含项目代码，项目文件需另外拷贝）。
 Write-Step '检查历史会话的工作区目录'
+Set-Progress -Phase '补建历史会话工作区目录' -Detail '按会话记录补建缺失的工作区空目录…' -Force
 Add-MissingWorkspaceDirs -HomeDir $DshHome
 
 # ---------------------------------------------------------------------------
@@ -665,6 +926,7 @@ Add-MissingWorkspaceDirs -HomeDir $DshHome
 # ---------------------------------------------------------------------------
 if (-not $SkipVerify) {
     Write-Step '校验配置'
+    Set-Progress -Phase '校验配置' -Detail '执行 dsh --profile web --dump-config 检查配置…' -Force
     $dshCmd = Join-Path $installDir 'resources\runtime\cli\bin\dsh.cmd'
     if (Test-Path -LiteralPath $dshCmd) {
         Write-Info '执行: dsh --profile web --dump-config'
@@ -694,6 +956,7 @@ if ($RestartApp) {
     $appExe = Join-Path $installDir 'DeepSeek Harness.exe'
     if (Test-Path -LiteralPath $appExe) {
         Write-Step '启动 DSH'
+        Set-Progress -Phase '启动 DSH' -Detail '正在启动 DSH 桌面版…' -Force
         try {
             Start-Process -FilePath $appExe -WorkingDirectory $installDir
             Write-Info '已请求启动 DSH 桌面版，请在任务栏托盘确认。'
@@ -709,6 +972,7 @@ if ($RestartApp) {
 # 7. 完成
 # ---------------------------------------------------------------------------
 Write-Step '恢复完成'
+Complete-Progress
 if ($oldHome) { Write-Info ('原数据目录已保存到: ' + $oldHome) }
 Write-Info ('数据目录: ' + $DshHome)
 Write-Host ''
